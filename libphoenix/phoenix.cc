@@ -13,6 +13,7 @@
 
 #include "phoenix.h"
 
+
 #define HUGE_PAGE_SIZE (64 * 1024)
 #define SMALL_PAGE_SIZE (4 * 1024)
 #define MMAP_LIMIT (1024 * 1024 * 1024)
@@ -263,7 +264,7 @@ int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr
                 p2p_map->vaddrs[i] = mmap(p2p_map->vaddrs[i],
                                         p2p_map->length_left,
                                         PROT_READ|PROT_WRITE,
-                                        MAP_SHARED,
+                                        MAP_SHARED ,
                                         pb->bdev_fd,
                                         0);
                 if ((u64)p2p_map->vaddrs[i] == 0xffffffffffffffff) {
@@ -282,7 +283,7 @@ int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr
                 p2p_map->vaddrs[i] = mmap(p2p_map->vaddrs[i],
                                         MMAP_LIMIT,
                                         PROT_READ|PROT_WRITE,
-                                        MAP_SHARED,
+                                       MAP_SHARED ,
                                         pb->bdev_fd,
                                         0);
                 if((u64)p2p_map->vaddrs[i] == 0xffffffffffffffff) {
@@ -300,7 +301,7 @@ int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr
             p2p_map->vaddrs[i] = mmap(p2p_map->vaddrs[i],
                                     MMAP_LIMIT,
                                     PROT_READ|PROT_WRITE,
-                                    MAP_SHARED,
+                                    MAP_SHARED ,
                                     pb->bdev_fd,
                                     0);
             if ((u64)p2p_map->vaddrs[i] == 0xffffffffffffffff) {
@@ -314,6 +315,7 @@ int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr
             }
             mmaped_len += MMAP_LIMIT;
         }
+        printf("p2p_map->vaddrs[%d]=%p\n", i, p2p_map->vaddrs[i]);
     }
     p2p_map->has_reg = 1;
     insert_phxfs_mmap_node(pb, p2p_map);
@@ -429,7 +431,7 @@ ssize_t phxfs_read(phxfs_fileid_t fid, void *buf, off_t buf_offset, ssize_t nbyt
         fprintf(stderr, "%s: phxfs_read pread error\n", __func__);
         return -1;
     }
-
+    
     for (i = 0;i < xfer_addr->nr_xfer_addrs; i++){
         target_addr = xfer_addr->x_addrs[i].target_addr;
         nbyte_per_iter = xfer_addr->x_addrs[i].nbyte;
@@ -526,13 +528,15 @@ struct phxfs_xfer_addr *phxfs_do_xfer_addr(int device_id, const void *buf, off_t
 
     for (i = start; i <= end; i++) {
         if(i == start){
-            offset_in_page = buf_offset % MMAP_LIMIT;
+            printf("buf:%p;n_addr:%lx,buf_offset:%lx,vaddrs:%p\n",buf,p2p_map->n_addr,buf_offset,p2p_map->vaddrs[i]);
+            // offset_in_page = ((u64)buf-p2p_map->n_addr+buf_offset) % MMAP_LIMIT;
+            offset_in_page = (buf_offset) % MMAP_LIMIT;
             if(count > 1)
                 nbyte_per_iter = MMAP_LIMIT - offset_in_page;
             else
                 nbyte_per_iter = nbyte_left;
             addr->x_addrs[addr->nr_xfer_addrs++] = (struct xfer_addr){
-                .target_addr = (void*)((u64)p2p_map->vaddrs[i] + offset_in_page),
+                .target_addr = (void*)((u64)p2p_map->vaddrs[i] + offset_in_page ),
                 .nbyte = nbyte_per_iter
             };
         }

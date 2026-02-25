@@ -8,15 +8,15 @@ import shlex
 from logger import Log
 
 result_path = ""
-FILE_PATH = "/mnt/phxfs/test.data"
+FILE_PATH = "/mnt/nvme/test.data"
 SUBDIR = "phxfs"
 # 1M 
 MB = 1024
-io_sizes = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
-threads = [1, 2, 4, 8, 16, 32, 64, 128]
+io_sizes = [256]
+threads = [1,2,4,8,16,32,64,128]
 batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 
-read_write = ["read" "write"]
+read_write = ["read"]
 file_path = os.path.dirname(os.path.realpath(__file__))
 micro_exec = os.path.join(file_path, "..", "build", "bin", "microbenchmark")
 
@@ -116,6 +116,7 @@ if __name__ == "__main__":
     # change the config to test different modes
     # for example, config.muti_thread indicates that multi-threading testing will be conducted
     config.muti_size = True
+    config.muti_thread = True
     x_thread_y_size_z_batch(config)
     config.reset()
 

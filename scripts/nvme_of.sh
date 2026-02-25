@@ -2,9 +2,9 @@
 
 nvme_subsystem_name="nvme-subsystem-name"
 namespaces=10
-nvme_device="/dev/nvme2n1"
+nvme_device="/dev/nvme0n1"
 nvme_port=1
-nvme_ip="192.168.0.219"
+nvme_ip="10.118.0.166"
 nvme_ip_port=4420
 
 if [ "$#" -ne 2 ]; then
@@ -14,30 +14,43 @@ fi
 
 mlex_model_probe(){
     modprobe nvmet
-    modprobe nvmet-rdma
-    modprobe nvme-rdma
+    modprobe nvmet-tcp  # 改为TCP模块
+    modprobe nvme-tcp   # 改为TCP模块
 }
 
 nvme_of_target_setup(){
-    sudo mkdir /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}
-    cd /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}
-    echo 1 | sudo tee attr_allow_any_host
-    sudo mkdir namespaces/${namespaces}
-    cd namespaces/${namespaces}
-    echo -n ${nvme_device} | sudo tee device_path
-    echo 1 | sudo tee enable
-    mkdir /sys/kernel/config/nvmet/ports/${nvme_port}
-    cd /sys/kernel/config/nvmet/ports/${nvme_port}
-    echo "${nvme_ip}" | sudo tee addr_traddr
-    echo rdma | sudo tee addr_trtype
-    echo ${nvme_ip_port} | sudo tee addr_trsvcid
-    echo ipv4 | sudo tee addr_adrfam
-    sudo ln -s /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name} /sys/kernel/config/nvmet/ports/1/subsystems/${nvme_subsystem_name}
+    # 加载必要的内核模块
+    mlex_model_probe
+    
+    # 创建子系统
+    sudo mkdir -p /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name} || exit 1
+    cd /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name} || exit 1
+    echo 1 | sudo tee attr_allow_any_host > /dev/null
+    
+    # 创建命名空间
+    sudo mkdir -p namespaces/${namespaces} || exit 1
+    cd namespaces/${namespaces} || exit 1
+    echo -n ${nvme_device} | sudo tee device_path > /dev/null
+    echo 1 | sudo tee enable > /dev/null
+    
+    # 创建端口
+    sudo mkdir -p /sys/kernel/config/nvmet/ports/${nvme_port} || exit 1
+    cd /sys/kernel/config/nvmet/ports/${nvme_port} || exit 1
+    echo "${nvme_ip}" | sudo tee addr_traddr > /dev/null
+    echo tcp | sudo tee addr_trtype > /dev/null  # 改为tcp
+    echo ${nvme_ip_port} | sudo tee addr_trsvcid > /dev/null
+    echo ipv4 | sudo tee addr_adrfam > /dev/null
+    
+    # 链接子系统到端口 - 使用变量而不是硬编码的"1"
+    sudo ln -sf /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name} \
+         /sys/kernel/config/nvmet/ports/${nvme_port}/subsystems/${nvme_subsystem_name}
+    
+    echo "NVMe-oF Target setup completed successfully (TCP mode)"
 }
 
 nvme_of_initiator_setup(){
-    sudo nvme discover -t rdma -q ${nvme_subsystem_name} -a ${nvme_ip} -s ${nvme_ip_port}
-    sudo nvme connect -t rdma -q ${nvme_subsystem_name} -n ${nvme_subsystem_name}  -a ${nvme_ip} -s ${nvme_ip_port}
+    sudo nvme discover -t tcp -q ${nvme_subsystem_name} -a ${nvme_ip} -s ${nvme_ip_port}  # 改为tcp
+    sudo nvme connect -t tcp -q ${nvme_subsystem_name} -n ${nvme_subsystem_name} -a ${nvme_ip} -s ${nvme_ip_port}  # 改为tcp
 }
 
 nvme_of_initiator_cleanup(){
@@ -45,29 +58,40 @@ nvme_of_initiator_cleanup(){
 }
 
 nvme_of_target_cleanup(){
-    sudo unlink /sys/kernel/config/nvmet/ports/1/subsystems/${nvme_subsystem_name}
-    cd /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}/namespaces/${namespaces}
-    echo 0 | sudo tee enable
-    cd /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}
-    sudo rmdir namespaces/${namespaces}
-    cd /sys/kernel/config/nvmet/subsystems/
-    sudo rmdir ${nvme_subsystem_name} 
-
-    sudo rmdir /sys/kernel/config/nvmet/ports/${nvme_port}
-    sudo rmdir /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}
+    # 移除链接
+    sudo rm -f /sys/kernel/config/nvmet/ports/${nvme_port}/subsystems/${nvme_subsystem_name}
+    
+    # 禁用并移除命名空间
+    if [ -d "/sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}/namespaces/${namespaces}" ]; then
+        echo 0 | sudo tee /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}/namespaces/${namespaces}/enable > /dev/null
+        sudo rmdir /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}/namespaces/${namespaces}
+    fi
+    
+    # 移除子系统
+    if [ -d "/sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}" ]; then
+        sudo rmdir /sys/kernel/config/nvmet/subsystems/${nvme_subsystem_name}
+    fi
+    
+    # 移除端口
+    if [ -d "/sys/kernel/config/nvmet/ports/${nvme_port}" ]; then
+        sudo rmdir /sys/kernel/config/nvmet/ports/${nvme_port}
+    fi
+    
+    echo "NVMe-oF Target cleanup completed"
 }
 
 check_nvme_cli(){
     if ! command -v nvme &> /dev/null
     then
         echo "nvme command could not be found"
-        exit
+        echo "Install with: apt-get install nvme-cli"
+        exit 1
     fi
 }
 
+# 主执行逻辑
 case "$1" in
     "target")
-        check_nvme_cli
         if [ "$2" == "setup" ]; then
             nvme_of_target_setup
         elif [ "$2" == "cleanup" ]; then

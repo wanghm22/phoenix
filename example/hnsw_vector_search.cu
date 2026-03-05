@@ -14,9 +14,9 @@
 // #include <cufile.h>
 #include "phoenix.h"
 // 配置参数 - 调整为更合理的值
-#define DIM 1024                    // 向量维度
-#define NUM_VECTORS 524288        // 减少到512MB数据: 1048576 * 128 * 4 = 512MB
-#define NUM_QUERIES 1000           // 减少查询数量
+#define DIM 16384                    // 向量维度
+#define NUM_VECTORS 32768        // 减少到512MB数据: 1048576 * 128 * 4 = 512MB
+#define NUM_QUERIES 64          // 减少查询数量
 #define TOP_K 6                   // 返回的最近邻数量
 #define MAX_EDGES_PER_NODE 8      // 每个节点的最大边数
 #define edge 64             // CUDA块大小
@@ -67,6 +67,7 @@ void generate(){
     }
     void* gpu_bf;
     cudaMalloc((void**)&gpu_bf,DIM*sizeof(unsigned int));
+    printf("Begin generate\n");
    while(node_num<NUM_VECTORS){
         for(int i=0;i<DIM;++i){
             vec[i] = rand()%edge;
@@ -81,6 +82,7 @@ void generate(){
         if(random%100==0){l+=1;}
         node[node_num].neighbor = (unsigned int *)malloc((l+1)*MAX_EDGES_PER_NODE*sizeof(unsigned int));
         node[node_num].layer = l;
+        printf("Begin insert\n");
         insert(node_num,gpu_bf,fd);
         node_num++;
    }
@@ -91,45 +93,30 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
    unsigned int layeridx = node[idx].layer;
    unsigned int startidx;
    int io_size = DIM*sizeof(unsigned int);
-   void** h_gpu_buffer = (void**)malloc(MAX_EDGES_PER_NODE * sizeof(void*));
-   void** gpu_buffer;
-    cudaMalloc((void**)&gpu_buffer,MAX_EDGES_PER_NODE * sizeof(void*));
-   void** target_addr = (void**)malloc(MAX_EDGES_PER_NODE * sizeof(void*));
+   void* gpu_buffer;
+   cudaMalloc(&gpu_buffer,MAX_EDGES_PER_NODE * io_size);
+   void* target_addr; 
    int ret;
    phxfs_fileid_t fid;
    fid.fd = file_fd;
    fid.deviceID = device_id; 
-   for(int j=0;j<MAX_EDGES_PER_NODE;++j){
-    cudaMalloc(&h_gpu_buffer[j], io_size);
-    
-    cudaMemset(h_gpu_buffer[j], 0x00, io_size);
-    
-    
-
-    // target_addr for register buffer less than 1GB
-    ret = phxfs_regmem(device_id, h_gpu_buffer[j], io_size, &target_addr[j]);
+   printf("Before Regmem\n");
+   ret = phxfs_regmem(device_id, gpu_buffer, MAX_EDGES_PER_NODE*io_size, &target_addr);
     
     if (ret) {
-        printf("phxfs regmem failed: %d\n", ret);
-        for(int k=0;k<=j;++k){cudaFree(h_gpu_buffer[k]);}
-        free(h_gpu_buffer);
-        cudaFree(gpu_buffer);
-    free(target_addr);
-    }
-        
-        // aligned_free(cpu_buffer);
-        close(file_fd);
-        return ;
-    }
-    
-   
-   cudaStreamSynchronize(0);
-   cudaMemcpy(gpu_buffer,h_gpu_buffer,MAX_EDGES_PER_NODE*sizeof(void*),cudaMemcpyHostToDevice);
+    printf("phxfs regmem failed: %d\n", ret);    
+    cudaFree(gpu_buffer);
+    close(file_fd);
+    return ;
+    }   
+   printf("After Regmem");
    PQElement* compute_result = (PQElement*)malloc(MAX_EDGES_PER_NODE*sizeof(PQElement));
+   PQElement* g_compute_result;
+   cudaMalloc(&g_compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement));
+   
    for(int i = layeridx;i>=0;--i){
     unsigned int numoflayer;//当前层其他向量数量
-    
-        if(i==0){
+    if(i==0){
         numoflayer = idx;
         if(numoflayer <= MAX_EDGES_PER_NODE){
             for(unsigned int j = 0;j<numoflayer;++j){
@@ -150,28 +137,26 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
                 
             
             if(iteration==1000){break;}   
-            ssize_t result; 
+    ssize_t result; 
     for(int j=0;j<MAX_EDGES_PER_NODE;++j){
-    result = phxfs_read(fid, (char*)gpu_buffer[j], 0, io_size, node[startidx].neighbor[j]*DIM*sizeof(unsigned int));
+    result = phxfs_read(fid, gpu_buffer, j*io_size, io_size, node[startidx].neighbor[j]*io_size);
     if (result != io_size) {
         printf("Read file error: expected %zu, got %zd\n", io_size, result);
-        
-        for(int k=0;k<MAX_EDGES_PER_NODE;++k){
-            phxfs_deregmem(device_id, gpu_buffer[k], io_size);
-            cudaFree(gpu_buffer[k]);
-        }
-        free(gpu_buffer);
-    free(target_addr);
-    free(compute_result);
+        phxfs_deregmem(device_id, gpu_buffer, MAX_EDGES_PER_NODE*io_size);
+        cudaFree(gpu_buffer);
+        free(compute_result);
+        cudaFree(g_compute_result);
         close(file_fd);
         return ;
     }
 }
     
-    for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){compute_result[i].id=node[startidx].neighbor[i];compute_result[i].distance=0;}
-    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,compute_result);
+    for(unsigned int j=0;j<MAX_EDGES_PER_NODE;++j){compute_result[j].id=node[startidx].neighbor[j];compute_result[j].distance=0;}
+    cudaMemcpy(g_compute_result,compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyHostToDevice);
+    compute<<<8,256>>>((unsigned int *)gpu_buffer,(unsigned int*)gpu_bf,g_compute_result);
     cudaDeviceSynchronize();
-    for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){pq_insert(pq,&pq_num,MAX_EDGES_PER_NODE,compute_result[i]);}
+    cudaMemcpy(compute_result,g_compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyDeviceToHost);
+    for(unsigned int j=0;j<MAX_EDGES_PER_NODE;++j){pq_insert(pq,&pq_num,MAX_EDGES_PER_NODE,compute_result[j]);}
     
     if(mindistance == pq[0].distance){
         for(int j=0;j<MAX_EDGES_PER_NODE;++j){
@@ -221,7 +206,7 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
     
     
     
-    result = phxfs_read(fid, (char*)gpu_buffer[j], 0, io_size, node[startidx].neighbor[MAX_EDGES_PER_NODE+j]*DIM*sizeof(unsigned int));
+    result = phxfs_read(fid, gpu_buffer[j], 0, io_size, node[startidx].neighbor[MAX_EDGES_PER_NODE+j]*DIM*sizeof(unsigned int));
     if (result != io_size) {
         printf("Read file error: expected %zu, got %zd\n", io_size, result);
         for(int k=0;k<MAX_EDGES_PER_NODE;++k){
@@ -230,14 +215,17 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
             free(gpu_buffer);
     free(target_addr);
     free(compute_result);
+    cudaFree(g_compute_result);
         close(file_fd);
         return ;
     }
 }
 
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){compute_result[i].id=node[startidx].neighbor[i];compute_result[i].distance=0;}
-    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,compute_result);
+    cudaMemcpy(g_compute_result,compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyHostToDevice);
+    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,g_compute_result);
     cudaDeviceSynchronize();
+    cudaMemcpy(compute_result,g_compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyDeviceToHost);
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){pq_insert(pq,&pq_num,MAX_EDGES_PER_NODE,compute_result[i]);}
    //保留最小逻辑还没有写，另外phxf关闭也没写。
     if(mindistance == pq[0].distance){
@@ -288,7 +276,7 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
 
     
     
-    result = phxfs_read(fid, (char*)gpu_buffer[j], 0, io_size, node[startidx].neighbor[2*MAX_EDGES_PER_NODE+j]*MAX_EDGES_PER_NODE*sizeof(unsigned int));
+    result = phxfs_read(fid, gpu_buffer[j], 0, io_size, node[startidx].neighbor[2*MAX_EDGES_PER_NODE+j]*DIM*sizeof(unsigned int));
     if (result != io_size) {
         printf("Read file error: expected %zu, got %zd\n", io_size, result);
         for(int k=0;k<MAX_EDGES_PER_NODE;++k){
@@ -297,14 +285,17 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
         free(gpu_buffer);
     free(target_addr);
     free(compute_result);
+    cudaFree(g_compute_result);
         close(file_fd);
         return ;
     }
 }
    
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){compute_result[i].id=node[startidx].neighbor[i];compute_result[i].distance=0;}
-    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,compute_result);
+    cudaMemcpy(g_compute_result,compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyHostToDevice);
+    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,g_compute_result);
     cudaDeviceSynchronize();
+    cudaMemcpy(compute_result,g_compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyDeviceToHost);
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){pq_insert(pq,&pq_num,MAX_EDGES_PER_NODE,compute_result[i]);}
    
     if(mindistance == pq[0].distance){
@@ -329,14 +320,16 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
     free(target_addr);
     free(h_gpu_buffer);
     free(compute_result);
+    cudaFree(g_compute_result);
 }
 
-__global__ void compute(unsigned int** gpu_buffer,unsigned int* gpu_bf,PQElement*compute_result){
+__global__ void compute(unsigned int* gpu_buffer,unsigned int* gpu_bf,PQElement*compute_result){
+   unsigned int io_size=DIM*sizeof(unsigned int);
    int id = blockIdx.x;
    unsigned int result = 0;
-   for(int i=4*threadIdx.x;i<(threadIdx.x+1)*4;++i){
-       if(gpu_buffer[id][i]<gpu_bf[i]){result+=(gpu_bf[i]-gpu_buffer[id][i])*(gpu_bf[i]-gpu_buffer[id][i]);}
-       else{result+=(gpu_buffer[id][i]-gpu_bf[i])*(gpu_buffer[id][i]-gpu_bf[i]);}
+   for(int i=64*threadIdx.x;i<(threadIdx.x+1)*64;++i){
+       if(gpu_buffer[id*io_size+i]<gpu_bf[i]){result+=(gpu_bf[i]-gpu_buffer[id*io_size+i])*(gpu_bf[i]-gpu_buffer[id*io_size+i]);}
+       else{result+=(gpu_buffer[id*io_size+i]-gpu_bf[i])*(gpu_buffer[id*io_size+i]-gpu_bf[i]);}
    }
    atomicAdd(&compute_result[id].distance, result);
 }
@@ -492,6 +485,8 @@ PQElement * find_topk(void* gpu_bf, int fd) {
     cudaStreamSynchronize(0);
     cudaMemcpy(gpu_buffer,h_gpu_buffer,MAX_EDGES_PER_NODE*sizeof(void*),cudaMemcpyHostToDevice);
     PQElement* compute_result = (PQElement*)malloc(MAX_EDGES_PER_NODE*sizeof(PQElement));
+    PQElement* g_compute_result;
+    cudaMalloc(&g_compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement));
    for(int i = layer_num;i>=0;--i){
     unsigned int numoflayer;//当前层其他向量数量
     
@@ -524,7 +519,7 @@ PQElement * find_topk(void* gpu_bf, int fd) {
     
      
     byte_num += io_size;
-    result = phxfs_read(fid, (char*)gpu_buffer[j], 0, io_size, node[startidx].neighbor[j]*DIM*sizeof(unsigned int));
+    result = phxfs_read(fid, gpu_buffer[j], 0, io_size, node[startidx].neighbor[j]*DIM*sizeof(unsigned int));
     if (result != io_size) {
         printf("Read file error: expected %zu, got %zd\n", io_size, result);
         for(int k=0;k<MAX_EDGES_PER_NODE;++k){
@@ -533,18 +528,28 @@ PQElement * find_topk(void* gpu_bf, int fd) {
         free(gpu_buffer);
     free(target_addr);
     free(compute_result);
+    cudaFree(g_compute_result);
         close(fd);
         return NULL;
     }
 }   
    
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){compute_result[i].id=node[startidx].neighbor[i];compute_result[i].distance=0;}
-    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,compute_result);
+    cudaMemcpy(g_compute_result,compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyHostToDevice);
+    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,g_compute_result);
     cudaDeviceSynchronize();
+    cudaMemcpy(compute_result,g_compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyDeviceToHost);
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){pq_insert(pq,&pq_num,TOP_K,compute_result[i]);}
     //保留最小逻辑还没有写，另外phxf关闭也没写。
     if(mindistance == pq[0].distance){
-        
+        for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){
+        phxfs_deregmem(device_id,gpu_buffer[i],io_size);
+        cudaFree(gpu_buffer[i]);
+    }
+    free(gpu_buffer);
+    free(target_addr);
+    free(compute_result);
+    cudaFree(g_compute_result);
         return pq;}
     else{mindistance = pq[0].distance;
     startidx = pq[0].id;}
@@ -581,7 +586,7 @@ PQElement * find_topk(void* gpu_bf, int fd) {
     
     
     byte_num += io_size;
-    result = phxfs_read(fid, (char*)gpu_buffer[j], 0, io_size, node[startidx].neighbor[MAX_EDGES_PER_NODE+j]*DIM*sizeof(unsigned int));
+    result = phxfs_read(fid, gpu_buffer[j], 0, io_size, node[startidx].neighbor[MAX_EDGES_PER_NODE+j]*DIM*sizeof(unsigned int));
     if (result != io_size) {
         printf("Read file error: expected %zu, got %zd\n", io_size, result);
         for(int k=0;k<MAX_EDGES_PER_NODE;++k){
@@ -590,14 +595,17 @@ PQElement * find_topk(void* gpu_bf, int fd) {
         free(gpu_buffer);
     free(target_addr);
     free(compute_result);
+    cudaFree(g_compute_result);
         close(fd);
         return NULL;
     }
 }
    
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){compute_result[i].id=node[startidx].neighbor[i];compute_result[i].distance=0;}
-    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,compute_result);
+    cudaMemcpy(g_compute_result,compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyHostToDevice);
+    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,g_compute_result);
     cudaDeviceSynchronize();
+    cudaMemcpy(compute_result,g_compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyDeviceToHost);
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){pq_insert(pq,&pq_num,TOP_K,compute_result[i]);}
     
     if(mindistance == pq[0].distance){
@@ -640,7 +648,7 @@ PQElement * find_topk(void* gpu_bf, int fd) {
     
    
     byte_num += io_size;
-    result = phxfs_read(fid, (char*)gpu_buffer[j], 0, io_size, node[startidx].neighbor[2*MAX_EDGES_PER_NODE+j]*DIM*sizeof(unsigned int));
+    result = phxfs_read(fid, gpu_buffer[j], 0, io_size, node[startidx].neighbor[2*MAX_EDGES_PER_NODE+j]*DIM*sizeof(unsigned int));
     if (result != io_size) {
         printf("Read file error: expected %zu, got %zd\n", io_size, result);
         for(int k=0;k<MAX_EDGES_PER_NODE;++k){
@@ -649,14 +657,17 @@ PQElement * find_topk(void* gpu_bf, int fd) {
         free(gpu_buffer);
     free(target_addr);
     free(compute_result);
+    cudaFree(g_compute_result);
         close(fd);
         return NULL;
     }
 }
 
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){compute_result[i].id=node[startidx].neighbor[i];compute_result[i].distance=0;}
-    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,compute_result);
+    cudaMemcpy(g_compute_result,compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyHostToDevice);
+    compute<<<8,256>>>((unsigned int **)gpu_buffer,(unsigned int*)gpu_bf,g_compute_result);
     cudaDeviceSynchronize();
+    cudaMemcpy(compute_result,g_compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement),cudaMemcpyDeviceToHost);
     for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){pq_insert(pq,&pq_num,TOP_K,compute_result[i]);}
   
     if(mindistance == pq[0].distance){
@@ -671,13 +682,7 @@ PQElement * find_topk(void* gpu_bf, int fd) {
        
     
    }
-   for(unsigned int i=0;i<MAX_EDGES_PER_NODE;++i){
-        phxfs_deregmem(device_id,gpu_buffer[i],io_size);
-        cudaFree(gpu_buffer[i]);
-    }
-    free(gpu_buffer);
-    free(target_addr);
-    free(compute_result);
+   
 }
 // 简化的图搜索核函数 - FIXED VERSION
 // __global__ void graph_search_kernel(

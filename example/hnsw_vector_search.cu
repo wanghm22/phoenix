@@ -10,6 +10,9 @@
 #include <sys/stat.h>
 #include <cuda_runtime.h>
 #include <cuda.h>
+#include <errno.h>
+#include <string.h>
+#include <malloc.h>
 #include<curand_kernel.h>
 // #include <cufile.h>
 #include "phoenix.h"
@@ -32,7 +35,7 @@ using namespace std;
         } \
     } while(0)
 
-char *filename = "/mnt/nvme/hnsw.data";
+char *filename = "/mnt/nvme/test.data";
 int device_id = 0;
 vector<unsigned int> layer1(0);
 vector<unsigned int> layer2(0);
@@ -49,72 +52,146 @@ typedef struct Node{
 }Node;
 Node node[NUM_VECTORS];
 void pq_insert(PQElement* queue, int* size, int max_size, PQElement elem);
-void insert(unsigned int idx,void* gpu_bf, int file_fd);
-__global__ void compute(unsigned int** gpu_buffer,unsigned int* gpu_bf,PQElement*compute_result);
+void insert(unsigned int idx,void* gpu_bf, phxfs_fileid_t fid,void* gpu_buffer,PQElement* compute_result,PQElement* g_compute_result,PQElement* pq);
+__global__ void compute(unsigned int* gpu_buffer,unsigned int* gpu_bf,PQElement*compute_result);
 PQElement* find_topk(void* gpu_bf, int fd);
 // 生成随机向量数据
-void generate(){
-   unsigned int node_num = 0;
-   unsigned int *vec = (unsigned int*)malloc(DIM*sizeof(unsigned int));
-   int fd;
-   fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-   srand(time(NULL));
-   int ret = phxfs_open(device_id);
+void generate() {
+    unsigned int node_num = 0;
+    int fd;
+    int io_size = DIM*sizeof(unsigned int);
+    fd = open(filename, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    srand(time(NULL));
+    void* target_addr;
+    void* target_addr_1;
+    unsigned int* vec=(unsigned int *)malloc(DIM*sizeof(unsigned int));
+    // 1. 写入向量（返回已打开的文件描述符）
+    for(int i=0;i<NUM_VECTORS;++i){
+        for(int j=0;j<DIM;++j){
+            vec[j]=rand()%edge;
+        }
+        ssize_t result=pwrite(fd,vec,DIM*sizeof(unsigned int),i*DIM*sizeof(unsigned int));
+        if(result!=io_size){printf("cnm\n");}
+    }
+    if (fd < 0) {
+        printf("Failed to write vectors\n");
+        return;
+    }
+    
+    // 3. 初始化 phxfs
+    int ret = phxfs_open(device_id);
     if (ret != 0) {
         printf("phxfs init failed: %d\n", ret);
         close(fd);
-        return ;
+        return;
     }
+    
+    // 4. 计算对齐的向量大小
+    size_t vector_size = DIM * sizeof(unsigned int);
+
+    
+    // 5. 分配对齐的GPU内存用于读取
     void* gpu_bf;
-    cudaMalloc((void**)&gpu_bf,DIM*sizeof(unsigned int));
-    printf("Begin generate\n");
-   while(node_num<NUM_VECTORS){
-        for(int i=0;i<DIM;++i){
-            vec[i] = rand()%edge;
-        }
-        ssize_t written;
-        written = pwrite(fd,vec,DIM*sizeof(unsigned int),node_num*DIM*sizeof(unsigned int));
+    // 方法1：使用cudaMalloc并确保对齐
+    cudaMalloc(&gpu_bf, vector_size);  // 分配对齐的大小
+    
+    // 或者方法2：使用自定义对齐分配
+    // gpu_bf = cudaMallocAligned(aligned_vector_size, block_size);
+    
+    printf("GPU buffer for reading: %p\n", gpu_bf);
+    
+    // 6. 分配其他GPU内存
+    void* gpu_buffer;
+    cudaMalloc(&gpu_buffer, MAX_EDGES_PER_NODE * vector_size);
+  
+    printf("Before Regmem\n");
+    ret = phxfs_regmem(device_id, gpu_buffer, MAX_EDGES_PER_NODE * vector_size, &target_addr);
+    if (ret) {
+        printf("phxfs regmem failed: %d\n", ret);    
+        cudaFree(gpu_buffer);
+        cudaFree(gpu_bf);
+        close(fd);
+        return;
+    }
+    ret = phxfs_regmem(device_id, gpu_bf, vector_size, &target_addr_1);
+    if (ret) {
+        printf("phxfs regmem failed: %d\n", ret); 
         
-        cudaMemcpy(gpu_bf, vec, DIM*sizeof(unsigned int), cudaMemcpyHostToDevice);
-        unsigned int l=0;
-        unsigned int random=rand();
-        if(random%10==0){l+=1;}
-        if(random%100==0){l+=1;}
-        node[node_num].neighbor = (unsigned int *)malloc((l+1)*MAX_EDGES_PER_NODE*sizeof(unsigned int));
+        cudaFree(gpu_buffer);
+        cudaFree(gpu_bf);
+        close(fd);
+        return;
+    }
+    // 7. 分配主机内存
+    PQElement* compute_result = (PQElement*)malloc(MAX_EDGES_PER_NODE * sizeof(PQElement));
+    PQElement* g_compute_result;
+    cudaMalloc(&g_compute_result, MAX_EDGES_PER_NODE * sizeof(PQElement));
+    PQElement* pq = (PQElement*)malloc(MAX_EDGES_PER_NODE * sizeof(PQElement));
+    
+    printf("Write Over\n");
+    
+    // 8. 设置phxfs文件ID
+    phxfs_fileid_t fid;
+    fid.fd = fd;
+    fid.deviceID = device_id;
+    
+    // 9. 读取向量并构建HNSW
+    printf("Starting to read vectors with O_DIRECT...\n");
+    
+    while (node_num < NUM_VECTORS) {
+        // 计算读取偏移量（使用实际向量大小，不是对齐的大小）
+        ssize_t written = phxfs_read(fid,gpu_bf,0,vector_size,node_num*vector_size);
+        if(written!=vector_size){
+        printf("pread failed: %d\n", written);    
+        cudaFree(gpu_buffer);
+        cudaFree(gpu_bf);
+        close(fd);
+        return;
+        }
+        // 检查对齐
+        
+        // 执行读取
+       
+        
+        // 确定节点层级
+        unsigned int l = 0;
+        unsigned int random = rand();
+        if (random % 10 == 0) l += 1;
+        if (random % 100 == 0) l += 1;
+        
+        // 分配节点邻居内存
+        node[node_num].neighbor = (unsigned int*)malloc(
+            (l + 1) * MAX_EDGES_PER_NODE * sizeof(unsigned int));
         node[node_num].layer = l;
-        printf("Begin insert\n");
-        insert(node_num,gpu_bf,fd);
+        
+        printf("Begin insert for node %u\n", node_num);
+        insert(node_num, gpu_bf, fid, gpu_buffer, 
+               compute_result, g_compute_result, pq);
+        
         node_num++;
-   }
-   phxfs_close(device_id);
-   close(fd);
+        
+        if (node_num % 100 == 0) {
+            printf("Processed %u/%d nodes\n", node_num, NUM_VECTORS);
+        }
+    }
+    
+    // 10. 清理资源
+    phxfs_deregmem(device_id, gpu_buffer, MAX_EDGES_PER_NODE * vector_size);
+    phxfs_deregmem(device_id, gpu_bf,  vector_size);
+    cudaFree(gpu_buffer);
+    cudaFree(gpu_bf);
+    free(compute_result);
+    cudaFree(g_compute_result);
+    free(pq);
+    phxfs_close(device_id);
+    close(fd);
+    
+    printf("Generate completed\n");
 }
-void insert(unsigned int idx,void* gpu_bf, int file_fd){
+void insert(unsigned int idx,void* gpu_bf, phxfs_fileid_t fid,void* gpu_buffer,PQElement* compute_result,PQElement* g_compute_result,PQElement* pq){
    unsigned int layeridx = node[idx].layer;
    unsigned int startidx;
    int io_size = DIM*sizeof(unsigned int);
-   void* gpu_buffer;
-   cudaMalloc(&gpu_buffer,MAX_EDGES_PER_NODE * io_size);
-   void* target_addr; 
-   int ret;
-   phxfs_fileid_t fid;
-   fid.fd = file_fd;
-   fid.deviceID = device_id; 
-   printf("Before Regmem\n");
-   ret = phxfs_regmem(device_id, gpu_buffer, MAX_EDGES_PER_NODE*io_size, &target_addr);
-    
-    if (ret) {
-    printf("phxfs regmem failed: %d\n", ret);    
-    cudaFree(gpu_buffer);
-    close(file_fd);
-    return ;
-    }   
-   printf("After Regmem");
-   PQElement* compute_result = (PQElement*)malloc(MAX_EDGES_PER_NODE*sizeof(PQElement));
-   PQElement* g_compute_result;
-   cudaMalloc(&g_compute_result,MAX_EDGES_PER_NODE*sizeof(PQElement));
-   PQElement* pq;
-    pq = (PQElement*)malloc(MAX_EDGES_PER_NODE*sizeof(PQElement));
    for(int i = layeridx;i>=0;--i){
     unsigned int numoflayer;//当前层其他向量数量
     if(i==0){
@@ -131,14 +208,13 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
                 startidx = rand()%numoflayer;
            }
             int pq_num = 0;
-            
             int iteration = 0; 
             while(1){//找出top-edges的边
-                
-            
             if(iteration==1000){break;}   
     ssize_t result; 
+    printf("Start reading");
     for(int j=0;j<MAX_EDGES_PER_NODE;++j){
+        printf("%d",node[startidx].neighbor[j]);
     result = phxfs_read(fid, gpu_buffer, j*io_size, io_size, node[startidx].neighbor[j]*io_size);
     if (result != io_size) {
         printf("Read file error: expected %zu, got %zd\n", io_size, result);
@@ -147,7 +223,6 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
         free(compute_result);
         free(pq);
         cudaFree(g_compute_result);
-        close(file_fd);
         return ;
     }
 }
@@ -214,7 +289,6 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
         free(compute_result);
         cudaFree(g_compute_result);
         free(pq);
-        close(file_fd);
         return ;}
 }
 
@@ -280,7 +354,6 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
         free(compute_result);
         free(pq);
         cudaFree(g_compute_result);
-        close(file_fd);
         return ;
     }
 }
@@ -306,12 +379,7 @@ void insert(unsigned int idx,void* gpu_bf, int file_fd){
         layer2.push_back(idx);
     }
    }
-   phxfs_deregmem(device_id, gpu_buffer, MAX_EDGES_PER_NODE*io_size);
-    cudaFree(gpu_buffer);
-    free(compute_result);
-    cudaFree(g_compute_result);
-    free(pq);
-    close(file_fd);
+   
     return ;
     
 }
@@ -455,7 +523,7 @@ PQElement * find_topk(void* gpu_bf, int fd) {
     if (ret) {
     printf("phxfs regmem failed: %d\n", ret);    
     cudaFree(gpu_buffer);
-    close(file_fd);
+    close(fd);
     return NULL;
     }   
    printf("After Regmem");
@@ -495,7 +563,7 @@ PQElement * find_topk(void* gpu_bf, int fd) {
         free(compute_result);
         free(pq);
         cudaFree(g_compute_result);
-        close(file_fd);
+        close(fd);
         return NULL;
     }
 }   
@@ -557,7 +625,7 @@ PQElement * find_topk(void* gpu_bf, int fd) {
         free(compute_result);
         free(pq);
         cudaFree(g_compute_result);
-        close(file_fd);
+        close(fd);
         return NULL;
     }
 }
@@ -616,7 +684,7 @@ PQElement * find_topk(void* gpu_bf, int fd) {
         free(compute_result);
         free(pq);
         cudaFree(g_compute_result);
-        close(file_fd);
+        close(fd);
         return NULL;
     }
 }
@@ -1151,130 +1219,6 @@ PQElement * find_topk(void* gpu_bf, int fd) {
 
 int main() {
     printf("=== Vector Search with GDS and Graph Index ===\n");
-    
-    // // 初始化GDS
-    // // CUfileError_t status = cuFileDriverOpen();
-    // // if (status.err != CU_FILE_SUCCESS) {
-    // //     fprintf(stderr, "Failed to initialize GDS driver: %d\n", status.err);
-    // //     return 1;
-    // // }
-    // // printf("GDS driver initialized successfully\n");
-    
-    // // 计算数据大小
-    // size_t vector_data_size = NUM_VECTORS * DIM * sizeof(float);
-    // size_t query_data_size = NUM_QUERIES * DIM * sizeof(float);
-    // size_t graph_edges_size = NUM_VECTORS * MAX_EDGES_PER_NODE * sizeof(int);
-    // size_t graph_counts_size = NUM_VECTORS * sizeof(int);
-    
-    // char vector_file[] = "/mnt/nvme/vector_data.bin";
-    // char query_file[] = "/mnt/nvme/query_data.bin";
-    // char graph_edges_file[] = "/mnt/nvme/graph_edges.bin";
-    // char graph_counts_file[] = "/mnt/nvme/graph_counts.bin";
-    
-    // printf("\nConfiguration:\n");
-    // printf("  Vector dimensions:     %d\n", DIM);
-    // printf("  Number of vectors:     %d\n", NUM_VECTORS);
-    // printf("  Vector data size:      %.2f MB\n", vector_data_size / (1024.0 * 1024.0));
-    // printf("  Number of queries:     %d\n", NUM_QUERIES);
-    // printf("  Max edges per node:    %d\n", MAX_EDGES_PER_NODE);
-    // printf("  Top-K results:         %d\n", TOP_K);
-    
-    // // 1. 生成向量数据（直接在GPU上生成）
-    // printf("\n1. Generating vector data on GPU...\n");
-    // float* d_vectors;
-    // CUDA_CHECK(cudaMalloc(&d_vectors, vector_data_size));
-    
-    // int threads = 256;
-    // int blocks = (NUM_VECTORS * DIM + threads - 1) / threads;
-    // generate_random_vectors_kernel<<<blocks, threads>>>(d_vectors, NUM_VECTORS, DIM, time(NULL));
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // // 2. 使用GDS写入向量数据到NVMe SSD
-    // printf("\n2. Writing vector data to NVMe SSD using GDS...\n");
-    // write_data_with_gds(d_vectors, vector_data_size, vector_file);
-    
-    // // 3. 生成查询数据
-    // printf("\n3. Generating query data...\n");
-    // float* d_queries;
-    // CUDA_CHECK(cudaMalloc(&d_queries, query_data_size));
-    // generate_random_vectors_kernel<<<blocks, threads>>>(d_queries, NUM_QUERIES, DIM, time(NULL) + 1);
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    // write_data_with_gds(d_queries, query_data_size, query_file);
-    
-    // // 4. 构建图索引
-    // printf("\n4. Building graph index...\n");
-    // int* d_graph_edges;
-    // int* d_edge_counts;
-    // CUDA_CHECK(cudaMalloc(&d_graph_edges, graph_edges_size));
-    // CUDA_CHECK(cudaMalloc(&d_edge_counts, graph_counts_size));
-    
-    // build_graph_index(d_graph_edges, d_edge_counts, NUM_VECTORS, MAX_EDGES_PER_NODE);
-    
-    // // 保存图索引到文件
-    // write_data_with_gds((float*)d_graph_edges, graph_edges_size, graph_edges_file);
-    
-    // // 5. 使用GDS重新读取数据（模拟实际工作负载）
-    // printf("\n5. Reading data back using GDS (simulating cold start)...\n");
-    
-    // cudaEvent_t gds_start, gds_stop;
-    // CUDA_CHECK(cudaEventCreate(&gds_start));
-    // CUDA_CHECK(cudaEventCreate(&gds_stop));
-    
-    // CUDA_CHECK(cudaEventRecord(gds_start));
-    
-    // // 释放原来的内存，模拟冷启动
-    // CUDA_CHECK(cudaFree(d_vectors));
-    // CUDA_CHECK(cudaFree(d_queries));
-    // CUDA_CHECK(cudaFree(d_graph_edges));
-    // CUDA_CHECK(cudaFree(d_edge_counts));
-    
-    // // 使用GDS重新读取
-    // void* target_vectors;
-    // void* target_queries;
-    // void* target_graph_edges;
-    // d_vectors = read_data_with_gds(vector_data_size, vector_file, target_vectors);
-    // d_queries = read_data_with_gds(query_data_size, query_file, target_queries);
-    // d_graph_edges = (int*)read_data_with_gds(graph_edges_size, graph_edges_file, target_graph_edges);
-    
-    // // 重新分配边计数（这个数据小，直接生成）
-    // CUDA_CHECK(cudaMalloc(&d_edge_counts, graph_counts_size));
-    // build_graph_index(d_graph_edges, d_edge_counts, NUM_VECTORS, MAX_EDGES_PER_NODE);
-    
-    // CUDA_CHECK(cudaEventRecord(gds_stop));
-    // CUDA_CHECK(cudaEventSynchronize(gds_stop));
-    
-    // float gds_time;
-    // CUDA_CHECK(cudaEventElapsedTime(&gds_time, gds_start, gds_stop));
-    // float total_mb = (vector_data_size + query_data_size + graph_edges_size) / (1024.0 * 1024.0);
-    // printf("Total GDS data transfer time: %.3f ms\n", gds_time);
-    // printf("Average GDS bandwidth: %.2f GB/s\n", (total_mb / 1024.0) / (gds_time / 1000.0));
-    
-    // // 6. 执行向量检索测试
-    // printf("\n6. Running vector search tests...\n");
-    // run_search_test(d_vectors, d_queries, d_graph_edges, d_edge_counts,(float*)target_vectors,(float*)target_queries,(int*)target_graph_edges,
-    //                NUM_VECTORS, NUM_QUERIES, DIM, TOP_K, MAX_EDGES_PER_NODE);
-    
-    // // 7. 清理资源
-    // printf("\n7. Cleaning up resources...\n");
-    // CUDA_CHECK(cudaFree(d_vectors));
-    // CUDA_CHECK(cudaFree(d_queries));
-    // CUDA_CHECK(cudaFree(d_graph_edges));
-    // CUDA_CHECK(cudaFree(d_edge_counts));
-    
-    // CUDA_CHECK(cudaEventDestroy(gds_start));
-    // CUDA_CHECK(cudaEventDestroy(gds_stop));
-    
-    // // 删除临时文件
-    // unlink(vector_file);
-    // unlink(query_file);
-    // unlink(graph_edges_file);
-    // unlink(graph_counts_file);
-    
-    // // 关闭GDS驱动
-    // // cuFileDriverClose();
-    
-    // printf("\n=== Test Completed Successfully ===\n");
-    
     generate();
     printf("generate finished\n");
     PQElement* data = (PQElement*)malloc(NUM_QUERIES * TOP_K * sizeof(PQElement));
@@ -1285,4 +1229,3 @@ for(int i = 0; i < NUM_QUERIES; ++i) {
     search_test(result);
     return 0;
 }
-//compute_result写一个gpu拷贝

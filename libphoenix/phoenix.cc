@@ -325,6 +325,109 @@ int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr
 }
 
 
+int phxfs_lazy_regmem(int device_id, const void *addr, size_t len, void **target_addr) {
+    if(len/ MMAP_LIMIT + ((len%MMAP_LIMIT==0)?0:1)<3){
+        return phxfs_regmem(device_id, addr, len, target_addr);
+    }
+    size_t i, ret = 0;
+
+    
+    phxfs_mmap_buffer_t *pb = &mbuffer[device_id];
+    phxfs_p2p_map_t *p2p_map = (phxfs_p2p_map_t *)malloc(sizeof(phxfs_p2p_map_t));
+    if (!p2p_map) {
+        fprintf(stderr, "%s: new_node is NULL\n", __func__);
+        return -1;
+    }
+
+    p2p_map->vaddrs = NULL;
+    p2p_map->length = len;
+    pb->device_id = device_id;
+
+    if (p2p_map->length % HUGE_PAGE_SIZE != 0) {
+        fprintf(stderr, "%s: p2p_map->length is not aligned\n", __func__);
+        free(p2p_map);
+        return -EFAULT;
+    }
+
+    p2p_map->mmap_count = p2p_map->length / MMAP_LIMIT;
+    if (p2p_map->length % MMAP_LIMIT) {
+        p2p_map->mmap_count++;
+        p2p_map->length_left = p2p_map->length % MMAP_LIMIT;
+    } else {
+        p2p_map->length_left = 0;
+    }
+
+    p2p_map->vaddrs = (void **)malloc(p2p_map->mmap_count * sizeof(void *));
+    if (p2p_map->vaddrs == NULL) {
+        fprintf(stderr, "%s: p2p_map->vaddrs malloc fail\n", __func__);
+        return -1;
+    }
+
+    p2p_map->n_addr = (u64)addr;
+  
+    
+    for(i=0 ; i< p2p_map->mmap_count; i++) {
+        p2p_map->vaddrs[i] = NULL;
+    }
+    p2p_map->vaddrs[0] = mmap(p2p_map->vaddrs[0],
+                                    MMAP_LIMIT,
+                                    PROT_READ|PROT_WRITE,
+                                    MAP_SHARED ,
+                                    pb->bdev_fd,
+                                    0);
+     if ((u64)p2p_map->vaddrs[0] == 0xffffffffffffffff) {
+                fprintf(stderr, "%s: p2p_map->vaddrs mmap fail\n", __func__);
+                return -EFAULT;
+            }
+    ret = __phxfs_regmem(pb, (u64)p2p_map->n_addr, (u64)p2p_map->vaddrs[0], MMAP_LIMIT);
+    if (ret) {
+                fprintf(stderr, "%s: p2p_map->vaddrs _phxfs_regmem fail\n", __func__);
+                return -EFAULT;
+            }
+    if(p2p_map->length_left){
+        p2p_map->vaddrs[p2p_map->mmap_count-1] = mmap(p2p_map->vaddrs[p2p_map->mmap_count-1],
+                                        p2p_map->length_left,
+                                        PROT_READ|PROT_WRITE,
+                                        MAP_SHARED ,
+                                        pb->bdev_fd,
+                                        0);
+        if ((u64)p2p_map->vaddrs[p2p_map->mmap_count-1] == 0xffffffffffffffff) {
+                    fprintf(stderr, "%s: p2p_map->vaddrs mmap fail\n", __func__);
+                    return -EFAULT;
+                }
+                // printf("phxfs_regmem 2\n ");
+                ret = __phxfs_regmem(pb, (u64)p2p_map->n_addr + MMAP_LIMIT*(p2p_map->mmap_count-1), (u64)p2p_map->vaddrs[p2p_map->mmap_count-1], p2p_map->length_left);
+                if (ret) {
+                    fprintf(stderr, "%s: p2p_map->vaddrs _phxfs_regmem fail\n", __func__);
+                    return -EFAULT;
+                }
+    }
+    else{
+        p2p_map->vaddrs[p2p_map->mmap_count-1] = mmap(p2p_map->vaddrs[p2p_map->mmap_count-1],
+                                        MMAP_LIMIT,
+                                        PROT_READ|PROT_WRITE,
+                                        MAP_SHARED ,
+                                        pb->bdev_fd,
+                                        0);
+         if ((u64)p2p_map->vaddrs[p2p_map->mmap_count-1] == 0xffffffffffffffff) {
+                    fprintf(stderr, "%s: p2p_map->vaddrs mmap fail\n", __func__);
+                    return -EFAULT;
+                }
+                // printf("phxfs_regmem 2\n ");
+                ret = __phxfs_regmem(pb, (u64)p2p_map->n_addr + MMAP_LIMIT*(p2p_map->mmap_count-1), (u64)p2p_map->vaddrs[p2p_map->mmap_count-1], MMAP_LIMIT);
+                if (ret) {
+                    fprintf(stderr, "%s: p2p_map->vaddrs _phxfs_regmem fail\n", __func__);
+                    return -EFAULT;
+                }
+    }
+    
+    p2p_map->has_reg = 1;
+    insert_phxfs_mmap_node(pb, p2p_map);
+    *target_addr = p2p_map->vaddrs[0];
+
+    return 0;
+}
+
 int __phxfs_deregmem(phxfs_mmap_buffer_t *pb, u64 n_addr, u64 c_addr, size_t len) {
     phxfs_ioctl_para_t para;
     int ret;
@@ -511,7 +614,26 @@ struct phxfs_xfer_addr *phxfs_do_xfer_addr(int device_id, const void *buf, off_t
     start = buf_offset / MMAP_LIMIT;
     end = (buf_offset + nbyte - 1) / MMAP_LIMIT;
     count = end - start + 1;
- 
+    size_t ret;
+    for(uint32_t j = start;j <=end ;++j){
+        if(p2p_map->vaddrs[j]==NULL){
+            p2p_map->vaddrs[j] = mmap(p2p_map->vaddrs[j],
+                                    MMAP_LIMIT,
+                                    PROT_READ|PROT_WRITE,
+                                    MAP_SHARED ,
+                                    _local_mbuffer->bdev_fd,
+                                    0);
+            if ((u64)p2p_map->vaddrs[j] == 0xffffffffffffffff) {
+                fprintf(stderr, "%s: p2p_map->vaddrs mmap fail\n", __func__);
+                return NULL;
+            }
+            ret = __phxfs_regmem(_local_mbuffer, (u64)p2p_map->n_addr+j*MMAP_LIMIT, (u64)p2p_map->vaddrs[j], MMAP_LIMIT);
+            if (ret) {
+                fprintf(stderr, "%s: p2p_map->vaddrs _phxfs_regmem fail\n", __func__);
+                return NULL;
+            }
+        }
+    }
     addr = (struct phxfs_xfer_addr *)std::malloc(sizeof(struct phxfs_xfer_addr) + (count - 1) * sizeof(struct xfer_addr));
     if (!addr) {
         fprintf(stderr, "%s: addr malloc fail\n", __func__);
@@ -529,8 +651,8 @@ struct phxfs_xfer_addr *phxfs_do_xfer_addr(int device_id, const void *buf, off_t
     for (i = start; i <= end; i++) {
         if(i == start){
             printf("buf:%p;n_addr:%lx,buf_offset:%lx,vaddrs:%p\n",buf,p2p_map->n_addr,buf_offset,p2p_map->vaddrs[i]);
-            // offset_in_page = ((u64)buf-p2p_map->n_addr+buf_offset) % MMAP_LIMIT;
-            offset_in_page = (buf_offset) % MMAP_LIMIT;
+            offset_in_page = ((u64)buf-p2p_map->n_addr+buf_offset) % MMAP_LIMIT;
+            // offset_in_page = (buf_offset) % MMAP_LIMIT;
             if(count > 1)
                 nbyte_per_iter = MMAP_LIMIT - offset_in_page;
             else

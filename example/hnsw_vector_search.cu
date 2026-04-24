@@ -480,16 +480,6 @@ PQElement * find_topk(void* gpu_bf, int fd) {
                
                 
                 ssize_t result; 
-
-   
-    
-
-    // ret = phxfs_open(device_id);
-    // if (ret != 0) {
-    //     printf("phxfs init failed: %d\n", ret);
-    //     close(file_fd);
-    //     return ;
-    // }
     
     for(int j=0;j<MAX_EDGES_PER_NODE;++j){
 
